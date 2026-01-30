@@ -1,10 +1,10 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const path = require('path');
 require('dotenv').config();
 const Calculation = require('./models/Calculation');
 
-const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -12,131 +12,101 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// Serve static files from the React app
-app.use(express.static(path.join(__dirname, '../frontend/dist')));
+// Request logging for production debugging
+app.use((req, res, next) => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+    next();
+});
 
-// MongoDB Connection
+// Production Paths (Absolute resolution)
+const distPath = path.resolve(__dirname, '..', 'frontend', 'dist');
+
+// Static Files serving
+app.use(express.static(distPath));
+
+// MongoDB Connection with Demo Mode Fallback
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/interestCalculator';
-
-// In-Memory Fallback Storage
 let memoryHistory = [];
 let isDemoMode = false;
 
-const connectDB = async () => {
-    try {
-        await mongoose.connect(MONGO_URI, {
-            serverSelectionTimeoutMS: 5000
-        });
-        console.log('✅ Connected to MongoDB');
-    } catch (err) {
+mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
+    .then(() => console.log('✅ Connected to MongoDB'))
+    .catch(err => {
         isDemoMode = true;
-        console.error('❌ MongoDB Connection Failed. Entering DEMO MODE (In-Memory).');
-        console.log('Calculation history will be lost on server restart.');
-        console.log('To persistence fix: Ensure MongoDB service is running.');
-    }
-};
-connectDB();
+        console.error('❌ MongoDB Connection Error:', err.message);
+        console.log('⚠️ Entering DEMO MODE (In-Memory). History will reset on restart.');
+    });
 
-// Routes
+// API Routes
+app.get('/api/ping', (req, res) => res.json({
+    status: 'active',
+    demoMode: isDemoMode,
+    dbState: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+}));
+
 app.post('/api/calculate', async (req, res, next) => {
     try {
-        console.log('📥 Calculation Request:', req.body);
         const { principal, rate, time, interestType } = req.body;
-
         const p = parseFloat(principal);
         const r = parseFloat(rate);
         const t = parseFloat(time);
 
         if (isNaN(p) || isNaN(r) || isNaN(t) || p <= 0 || r <= 0 || t <= 0) {
-            console.log('⚠️ Validation Failed:', { p, r, t });
             return res.status(400).json({ error: 'Values must be valid positive numbers.' });
         }
 
-        let interestAmount = 0;
-        if (interestType === 'simple') {
-            interestAmount = (p * r * t) / 100;
-        } else if (interestType === 'compound') {
-            interestAmount = p * Math.pow((1 + r / 100), t) - p;
+        let interest = 0;
+        if (interestType === 'simple') interest = (p * r * t) / 100;
+        else interest = p * Math.pow((1 + r / 100), t) - p;
+
+        const result = {
+            principal: p,
+            rate: r,
+            time: t,
+            interestType,
+            interestAmount: Number(interest.toFixed(2)),
+            totalAmount: Number((p + interest).toFixed(2)),
+            createdAt: new Date()
+        };
+
+        if (!isDemoMode && mongoose.connection.readyState === 1) {
+            const saved = await new Calculation(result).save();
+            res.status(201).json(saved);
         } else {
-            return res.status(400).json({ error: 'Invalid interest model.' });
+            const demoResult = { ...result, _id: 'demo_' + Date.now() };
+            memoryHistory.unshift(demoResult);
+            res.status(201).json(demoResult);
         }
-
-        let resultData;
-        const interestFixed = parseFloat(interestAmount.toFixed(2));
-        const totalFixed = parseFloat((p + interestAmount).toFixed(2));
-
-        // Effective Demo Mode if not connected
-        const effectiveDemo = isDemoMode || mongoose.connection.readyState !== 1;
-
-        if (effectiveDemo) {
-            resultData = {
-                _id: 'auto_' + Math.random().toString(36).substr(2, 9),
-                principal: p,
-                rate: r,
-                time: t,
-                interestType,
-                interestAmount: interestFixed,
-                totalAmount: totalFixed,
-                createdAt: new Date()
-            };
-            memoryHistory.unshift(resultData);
-            console.log('💾 Handled in Demo Mode (Memory)');
-        } else {
-            const newCalculation = new Calculation({
-                principal: p,
-                rate: r,
-                time: t,
-                interestType,
-                interestAmount: interestFixed,
-                totalAmount: totalFixed
-            });
-            await newCalculation.save();
-            resultData = newCalculation;
-            console.log('💾 Saved to MongoDB');
-        }
-
-        res.status(201).json(resultData);
-    } catch (err) {
-        console.error('❌ Calculation Error:', err);
-        next(err);
-    }
+    } catch (err) { next(err); }
 });
-
-
 
 app.get('/api/history', async (req, res, next) => {
     try {
-        const effectiveDemo = isDemoMode || mongoose.connection.readyState !== 1;
-
-        if (effectiveDemo) {
-            return res.json(memoryHistory);
+        if (!isDemoMode && mongoose.connection.readyState === 1) {
+            const history = await Calculation.find().sort({ createdAt: -1 });
+            return res.json(history);
         }
-        const history = await Calculation.find().sort({ createdAt: -1 });
-        res.json(history);
+        res.json(memoryHistory);
     } catch (err) {
         console.error('❌ History Fetch Error:', err.message);
-        res.json(memoryHistory); // Safe fallback
+        res.json(memoryHistory);
     }
 });
 
-
+// SPA Fallback - MUST BE AFTER API ROUTES
+// This handles client-side routing and serves index.html for unknown routes
+app.use((req, res, next) => {
+    if (req.url.startsWith('/api')) return res.status(404).json({ error: 'API route not found' });
+    res.sendFile(path.join(distPath, 'index.html'));
+});
 
 // Global Error Handler
 app.use((err, req, res, next) => {
     console.error('🔥 Server Error:', err.stack);
-    res.status(500).json({
-        error: 'An internal server error occurred.',
-        details: process.env.NODE_ENV === 'development' ? err.message : undefined
-    });
-});
-
-// Fallback to React App for SPA routing
-app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
+    res.status(500).json({ error: 'Internal server error occurred.' });
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 Server active on port ${PORT}`);
-    console.log(`📡 API Endpoints ready at http://localhost:${PORT}/api`);
+    console.log(`🚀 Server listening on port ${PORT}`);
+    console.log(`📡 Serving static files from: ${distPath}`);
 });
-
